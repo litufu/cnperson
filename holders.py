@@ -1,8 +1,10 @@
 import tushare as ts
 import pandas as pd
+import numpy as np
 import time
 import requests
 import re
+from datetime import datetime
 from bs4 import BeautifulSoup
 import io
 from sqlalchemy import create_engine
@@ -29,6 +31,8 @@ headers = {
 }
 # 追溯股东层数
 level = 1
+# 下载股东列表
+times = 1
 
 
 def get_cookies():
@@ -155,39 +159,36 @@ def get_stocks():
         return df
 
 
-def get_top10_holders(start_date, end_date):
+def get_top10_holders(dbname, start_date, end_date):
     # 下载所有股票的前10大股东
     # 示例 ：
     # get_top10_holders(start_date="20180901", end_date="20181231")
     stocks = get_stocks()
     for ts_code in stocks["ts_code"]:
         # 遍历所有的股票列表，获取所有的前10大股东列表
-        if utils.has_record("top10", ts_code):
+        if utils.has_record(dbname, ts_code):
             continue
         try:
             df = pro.top10_holders(ts_code=ts_code, start_date=start_date, end_date=end_date)
         except requests.exceptions.ConnectTimeout as e:
-            get_top10_holders(start_date=start_date, end_date=end_date)
+            get_top10_holders(dbname=dbname, start_date=start_date, end_date=end_date)
         time.sleep(2)
         df_top10 = df[0:10]
-        df_top10.to_sql('top10', con=engine, if_exists="append", index=False)
-        utils.save_record('top10', ts_code)
+        df_top10.to_sql(dbname, con=engine, if_exists="append", index=False)
+        utils.save_record(dbname, ts_code)
 
 
 def download_holders(company_name):
+    global times
+    if times > 10:
+        logger.warning('没有能够下载{}股东'.format(company_name))
+        raise Exception('没有能够下载{}股东'.format(company_name))
     try:
-        download_company_holders(company_name)
+        df = download_company_holders(company_name)
+        return df
     except Exception as e:
+        times += 1
         download_holders(company_name)
-
-
-def download_all_holders():
-    df = pd.read_sql_table('top10', con=engine)
-    df = df[['ts_code', 'ann_date', 'end_date', 'holder_name', 'hold_amount', 'hold_ratio']]
-    company_df = df[df['holder_name'].str.endswith('公司')]
-    for row in company_df.itertuples(index=True, name='Pandas'):
-        print(row.holder_name)
-        download_holders(row.holder_name)
 
 
 def get_all_holders(name):
@@ -267,7 +268,7 @@ def get_all_holders(name):
                                                            'holder_name', 'hold_amount', 'hold_ratio']]
             company_top10_holders.to_sql(name, con=engine, if_exists="replace", index=False)
         else:
-            new_holders_df = download_company_holders(company_name)
+            new_holders_df = download_holders(company_name)
             # 如果没有找到股东列表，将该公司添加到未找到公司列表中
             if new_holders_df.empty:
                 df_not_found_holders = df_not_found_holders.append(
@@ -286,8 +287,21 @@ def get_all_holders(name):
                 new_holders_df['end_date'] = company_end_date
                 # 判断是否存在股本占比，如果不存在的话使用认缴金额重新计算
                 if new_holders_df['ratio'].str.contains('%').sum() == 0:
-                    new_holders_df['ratio_float'] = new_holders_df['promise_to_pay_amount'] / \
-                                              new_holders_df['promise_to_pay_amount'].sum()
+                    if new_holders_df['promise_to_pay_amount'].str.contains('\d').sum() > 1:
+                        new_holders_df['ratio_float'] = new_holders_df['promise_to_pay_amount'] / \
+                                                  new_holders_df['promise_to_pay_amount'].sum()
+                    else:
+                        df_not_found_holders = df_not_found_holders.append(
+                            pd.DataFrame({'ts_code': [company_code], 'ann_date': [company_ann_date],
+                                          'end_date': [company_end_date], 'holder_name': [company_name],
+                                          'hold_amount': [company_hold_amount], 'hold_ratio': [company_hold_ratio]}),
+                            ignore_index=True)
+                        df_not_found_holders_company = df_not_found_holders_company.append(
+                            pd.DataFrame({'ts_code': [company_code], 'ann_date': [company_ann_date],
+                                          'end_date': [company_end_date], 'holder_name': [company_name],
+                                          'hold_amount': [company_hold_amount], 'hold_ratio': [company_hold_ratio]}),
+                            ignore_index=True)
+                        continue
                 else:
                     new_holders_df['ratio_float'] = new_holders_df['ratio'].str.strip("%").astype(float) / 100
                 new_holders_df['hold_amount'] = new_holders_df['ratio_float'] * company_hold_amount
@@ -302,17 +316,40 @@ def get_all_holders(name):
     get_all_holders(name)
 
 
-# get_all_holders('top10')
+def compute_cn_rich_persons():
+    # 获取今天日期
+    today_date = datetime.now().strftime('%Y%m%d')
+    # 获取上一个交易日
+    trade_date = pro.trade_cal(exchange='', start_date=today_date,
+                               end_date=today_date, fields='cal_date,is_open,pretrade_date')['pretrade_date'].values[0]
+    # 检查是否已经存储上一个交易日的交易信息
+    # try:
+    #     pre_trade_info_df = pd.read_sql_table('trade_info',con=engine)
+    #     if len(pre_trade_info_df[pre_trade_info_df['trade_date'].str.match(trade_date)]) == 0:
+    #         pre_trade_info_has_saved = False
+    #     else:
+    #         return
+    # except ValueError as e:
+    #     pre_trade_info_has_saved = False
+    # if not pre_trade_info_has_saved:
+    if not False:
+        trade_info_df = pro.daily_basic(ts_code='', trade_date=trade_date,
+                                        fields='ts_code,trade_date,close,total_share,total_mv')
+        trade_info_df.to_sql('trade_info', con=engine, if_exists='replace', index=False)
+        df = pd.read_sql_table('one', con=engine)
+        df = df.merge(trade_info_df, how='left', on='ts_code')
+        df['wealth'] = df['total_mv'] * df['hold_ratio']
+        table = df.pivot_table(values='wealth', index=['holder_name'], columns=['trade_date'], aggfunc=np.sum)
+        table = table.reset_index()
+        table = table.sort_values(by=[trade_date], ascending=False)
+        table.to_json('{}.json'.format(trade_date),orient='records')
+        return table
 
-# new_holders_df1 = download_company_holders("佳源创盛控股集团有限公司")
-# print(new_holders_df1)
-df = pd.read_sql_table('top10', con=engine)
-print(len(df))
-# 获取所有股票的行情信息
-# df = pro.daily_basic(ts_code='', trade_date='20190422', fields='ts_code,trade_date,close,total_share,total_mv')
-# print(df)
 
-
-
-
-
+if __name__ == '__main__':
+    # 第一步获取所有上市公司的前10大股东,
+    # get_top10_holders(dbname='top10', start_date="20180901", end_date="20181231")
+    # 第二步：获取所有上市公司前10大股东的股东列表
+    get_all_holders('top10')
+    # 第三步下载当天的股票价格，计算财富排行榜
+    # compute_cn_rich_persons()
